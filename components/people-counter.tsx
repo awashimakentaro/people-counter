@@ -1,6 +1,7 @@
 "use client"
 
 import { useEffect, useRef, useState, useCallback } from "react"
+import * as tf from "@tensorflow/tfjs"
 import * as cocossd from "@tensorflow-models/coco-ssd"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
@@ -16,16 +17,17 @@ export default function PeopleCounter() {
   const [history, setHistory] = useState<{ timestamp: Date; direction: string }[]>([])
   const [cameraError, setCameraError] = useState<string | null>(null)
   const [cameraReady, setCameraReady] = useState(false)
-  const [debugMode, setDebugMode] = useState(false)
+  const [debugMode, setDebugMode] = useState(true) // デフォルトでデバッグモードをオン
   const [detectionInfo, setDetectionInfo] = useState<string>("")
-  const [sensitivity, setSensitivity] = useState<number>(100) // デフォルトを100に変更（最大感度）
-  const [threshold, setThreshold] = useState<number>(20) // 移動距離の閾値（デフォルト20ピクセル）
+  const [sensitivity, setSensitivity] = useState<number>(100) // 最大感度
+  const [threshold, setThreshold] = useState<number>(5) // 移動距離の閾値を5に下げる（より敏感に）
   const [showAdvanced, setShowAdvanced] = useState(false)
-  const [resolution, setResolution] = useState<string>("medium") // low, medium, high
-  const [detectionInterval, setDetectionInterval] = useState<number>(1) // フレーム間隔（1=毎フレーム、2=1フレームおき）
+  const [resolution, setResolution] = useState<string>("low") // 低解像度をデフォルトに
+  const [detectionInterval, setDetectionInterval] = useState<number>(2) // フレーム間隔（1=毎フレーム、2=1フレームおき）
   const frameCountRef = useRef(0)
   const [performanceInfo, setPerformanceInfo] = useState<string>("")
   const lastProcessTimeRef = useRef(0)
+  const [tfBackend, setTfBackend] = useState<string>("")
 
   // 検出された人物を追跡するための状態
   const detectedPeopleRef = useRef<
@@ -57,6 +59,43 @@ export default function PeopleCounter() {
         return { width: 640, height: 480 }
     }
   }, [resolution])
+
+  // TensorFlow.jsの初期化
+  useEffect(() => {
+    async function initTensorFlow() {
+      try {
+        console.log("TensorFlow.jsを初期化中...")
+
+        // 利用可能なバックエンドを確認（エラーが発生する行を修正）
+        // TypeScriptエラーを回避するために、型アサーションを使用
+        const registry = tf.engine().registry as Record<string, any>
+        const backends = Object.keys(registry).filter((backend) => registry[backend] != null)
+        console.log("利用可能なバックエンド:", backends)
+
+        // WebGLバックエンドを優先的に使用
+        if (backends.includes("webgl")) {
+          await tf.setBackend("webgl")
+        } else if (backends.includes("wasm")) {
+          await tf.setBackend("wasm")
+        } else {
+          await tf.setBackend("cpu")
+        }
+
+        // バックエンドの初期化を確認
+        const backend = tf.getBackend()
+        console.log("使用中のバックエンド:", backend)
+        setTfBackend(backend || "不明")
+
+        // TensorFlow.jsの準備完了
+        console.log("TensorFlow.jsの初期化完了")
+      } catch (error) {
+        console.error("TensorFlow.jsの初期化エラー:", error)
+        setCameraError(`TensorFlow.jsの初期化エラー: ${error instanceof Error ? error.message : String(error)}`)
+      }
+    }
+
+    initTensorFlow()
+  }, [])
 
   // setupCamera関数をコンポーネントのトップレベルで定義（useCallbackを使用）
   const setupCamera = useCallback(async () => {
@@ -105,26 +144,36 @@ export default function PeopleCounter() {
   // モデルの読み込み
   useEffect(() => {
     async function loadModel() {
+      // TensorFlow.jsのバックエンドが設定されていない場合は待機
+      if (!tfBackend) return
+
       try {
         console.log("モデルを読み込み中...")
         // モデルのロード時にbaseUrlを指定して、CDNからロードする
         const loadedModel = await cocossd.load({
           base: "lite_mobilenet_v2", // より軽量なモデルを使用
         })
-        setModel(loadedModel)
         console.log("モデルの読み込みが完了しました")
+        setModel(loadedModel)
+
+        // テスト検出を実行
+        if (videoRef.current && videoRef.current.readyState >= 2) {
+          try {
+            console.log("テスト検出を実行中...")
+            const predictions = await loadedModel.detect(videoRef.current)
+            console.log("テスト検出結果:", predictions)
+          } catch (testError) {
+            console.error("テスト検出エラー:", testError)
+          }
+        }
       } catch (error) {
         console.error("モデルの読み込みに失敗しました:", error)
-        setCameraError("モデルの読み込みに失敗しました。ページを再読み込みしてください。")
+        setCameraError(`モデルの読み込みエラー: ${error instanceof Error ? error.message : String(error)}`)
       }
     }
 
     loadModel()
-
-    return () => {
-      // クリーンアップ
-    }
-  }, [])
+  }, [tfBackend])
 
   // カメラの初期化
   useEffect(() => {
@@ -190,6 +239,7 @@ export default function PeopleCounter() {
       // 人物検出
       try {
         const predictions = await model.detect(video)
+        console.log("検出結果:", predictions)
 
         const endTime = performance.now()
         const processTime = endTime - startTime
@@ -202,7 +252,11 @@ export default function PeopleCounter() {
 
         // デバッグ情報を更新
         if (debugMode) {
-          setDetectionInfo(`検出: ${predictions.filter((p) => p.class === "person").length}人`)
+          let detectionText = ""
+          for (const pred of predictions) {
+            detectionText += `${pred.class} (${Math.round(pred.score * 100)}%) `
+          }
+          setDetectionInfo(`検出: ${detectionText || "なし"}`)
         }
 
         // 現在の時間
@@ -211,9 +265,12 @@ export default function PeopleCounter() {
         // 既存の追跡対象を更新
         const currentDetectedPeople = new Map(detectedPeopleRef.current)
 
-        // 検出された人物を処理
+        // 検出されたオブジェクトを処理（人だけでなく全てのオブジェクト）
         for (const prediction of predictions) {
-          if (prediction.class === "person") {
+          // すべてのオブジェクトを検出対象にする（人に限定しない）
+          // if (prediction.class === "person") {
+          if (prediction.score > 0.3) {
+            // スコアが0.3以上のオブジェクトを検出
             const bbox = prediction.bbox
             const centerX = bbox[0] + bbox[2] / 2
             const centerY = bbox[1] + bbox[3] / 2
@@ -478,6 +535,13 @@ export default function PeopleCounter() {
               </button>
             </div>
           )}
+
+          {/* TensorFlow.jsの状態表示 */}
+          <div className="mb-4 p-3 bg-blue-50 border border-blue-200 text-blue-700 rounded">
+            <p>TensorFlow.jsバックエンド: {tfBackend || "初期化中..."}</p>
+            <p>モデルの状態: {model ? "読み込み完了" : "読み込み中..."}</p>
+          </div>
+
           <div className="relative">
             <video ref={videoRef} className="w-full rounded-lg" autoPlay playsInline muted />
             <canvas ref={canvasRef} className="absolute top-0 left-0 w-full h-full" />
@@ -491,7 +555,7 @@ export default function PeopleCounter() {
           </div>
 
           <div className="flex flex-wrap gap-2 mt-4">
-            <Button onClick={toggleDetection}>
+            <Button onClick={toggleDetection} disabled={!model}>
               {isRunning ? <Pause className="mr-2 h-4 w-4" /> : <Play className="mr-2 h-4 w-4" />}
               {isRunning ? "停止" : "開始"}
             </Button>
